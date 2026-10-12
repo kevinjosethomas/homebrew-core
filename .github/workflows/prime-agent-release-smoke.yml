@@ -1,0 +1,163 @@
+name: Prime Agent 0.10.0 Windows release smoke
+on:
+  push:
+    branches: [prime-agent-0.10.0-windows-smoke]
+    paths: [.github/workflows/prime-agent-release-smoke.yml]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Install pinned release and require working kernel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'prime-agent-0.10.0-smoke'
+          New-Item -ItemType Directory -Path $root | Out-Null
+          Set-Location $root
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
+          $base = 'https://github.com/PrimeIntellect-ai/prime-agent/releases/download/v0.10.0'
+          Invoke-WebRequest "$base/prime-agent-0.10.0-win32-x64.tar.gz" -OutFile release.tar.gz
+          if ((Get-FileHash release.tar.gz -Algorithm SHA256).Hash.ToLower() -ne '1b61708361f75336dbc1897b88a26a298bab354162122a9e9e34c2e7e4635f8b') { throw 'release checksum mismatch' }
+          New-Item -ItemType Directory reference | Out-Null
+          tar -xzf release.tar.gz -C reference
+          if ($LASTEXITCODE -ne 0) { throw 'archive extraction failed' }
+          Invoke-WebRequest 'https://raw.githubusercontent.com/PrimeIntellect-ai/prime-agent/763094e1b6a7c17450ee8399b06cda1853847ca5/install.ps1' -OutFile install.ps1
+          if ((Get-FileHash install.ps1 -Algorithm SHA256).Hash.ToLower() -ne '2b29c4cc8069ba4f0b8850328962847f05bf79ff83560c2a87144cca594a4417') { throw 'installer checksum mismatch' }
+          $env:PRIME_AGENT_VERSION = '0.10.0'
+          $env:PRIME_AGENT_RELEASE_CHANNEL = 'stable'
+          $env:PRIME_AGENT_RUST_PREFIX = Join-Path $root 'prefix'
+          $env:PRIME_AGENT_UV_BIN_DIR = Join-Path $root 'uv-bin'
+          $env:PRIME_AGENT_KERNEL_VENV = Join-Path $root 'kernel-venv'
+          $env:PRIME_AGENT_CODING_AGENT_DIR = Join-Path $root 'agent'
+          $env:UV_CACHE_DIR = Join-Path $root 'uv-cache'
+          $env:UV_PYTHON_INSTALL_DIR = Join-Path $root 'uv-python'
+          $env:DO_NOT_TRACK = '1'
+          $env:PYTHONUTF8 = '1'
+          & pwsh -NoProfile -File install.ps1 2>&1 | Tee-Object install.log
+          if ($LASTEXITCODE -ne 0) { throw 'installer failed' }
+          $env:PATH = "$root\prefix\bin;$root\uv-bin;$env:PATH"
+          $version = & prime-agent --version
+          if ($LASTEXITCODE -ne 0 -or "$version".Trim() -ne '0.10.0') { throw "PATH launch mismatch: $version" }
+          $binary = Join-Path $root 'prefix\share\prime-agent\prime-agent.exe'
+          if ((Get-FileHash $binary).Hash -ne (Get-FileHash 'reference\prime-agent.exe').Hash) { throw 'installed binary differs from pinned release' }
+          & $binary --prime-agent-bootstrap 2>&1 | Tee-Object bootstrap.log
+          if ($LASTEXITCODE -ne 0) { throw 'kernel bootstrap failed' }
+          $python = Join-Path $env:PRIME_AGENT_KERNEL_VENV 'Scripts\python.exe'
+          if (-not (Test-Path $python)) { throw 'kernel interpreter missing' }
+          & $python -c 'import sys, rlm, dill, mcp, tyro, numpy, scipy, pandas; print(sys.version)'
+          if ($LASTEXITCODE -ne 0) { throw 'required kernel dependencies missing' }
+          $env:TEST_AGENT_BINARY = $binary
+          $env:TEST_KERNEL_PYTHON = $python
+          @'
+          """Drive the released Homebrew binary with a local deterministic model server."""
+          import http.server
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import threading
+          import tempfile
+
+          warmup = os.environ.get('PRIME_SMOKE_WARMUP') == '1'
+          root = Path.cwd() / ('warmup-probe' if warmup else 'offline-probe')
+          root.mkdir()
+          agent = root / 'agent'
+          agent.mkdir()
+          blocked = root / 'blocked-bin'
+          blocked.mkdir()
+          (blocked / 'uv.cmd').write_text('@echo off\necho invoked > "' + str(root / 'uv-was-invoked') + '"\necho UV_MUST_NOT_RUN 1>&2\nexit /b 99\n')
+          cells = [
+              "brew_probe = 41\nprint('FIRST_CELL_OK')",
+              "assert brew_probe + 1 == 42\nimport rlm, dill, mcp, tyro, numpy, pandas, scipy, requests, httpx, yaml, tomli, dotenv, bs4, lxml, pydantic\nimport edit, compact, refine, goal, agent_message, agent_observe, rlm_heartbeat, websearch, attach_image\nassert numpy.arange(3).sum() == 3\nassert pandas.DataFrame({'a': [1, 2]}).a.sum() == 3\nfrom scipy import linalg\nassert abs(linalg.det(numpy.eye(2)) - 1) < 1e-9\nfrom PIL import Image\nassert Image.new('RGB', (2, 2)).size == (2, 2)\nprint('PERSISTENCE_AND_ALL_SKILLS_OK', brew_probe + 1)",
+          ]
+          requests = []
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def log_message(self, *args):
+                  pass
+
+              def do_POST(self):
+                  request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                  requests.append(request)
+                  index = len(requests) - 1
+                  if index < len(cells):
+                      delta = {'role': 'assistant', 'tool_calls': [{'index': 0, 'id': f'brew-cell-{index}', 'type': 'function', 'function': {'name': 'ipython', 'arguments': json.dumps({'code': cells[index]})}}]}
+                      finish = 'tool_calls'
+                  else:
+                      delta = {'role': 'assistant', 'content': 'BREW_KERNEL_E2E_DONE'}
+                      finish = 'stop'
+                  frames = [
+                      {'id': f'brew-{index}', 'object': 'chat.completion.chunk', 'model': 'brew-probe', 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]},
+                      {'id': f'brew-{index}', 'object': 'chat.completion.chunk', 'model': 'brew-probe', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}], 'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}},
+                  ]
+                  body = ''.join('data: ' + json.dumps(f) + '\n\n' for f in frames) + 'data: [DONE]\n\n'
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'text/event-stream')
+                  self.send_header('Content-Length', str(len(body.encode())))
+                  self.end_headers()
+                  self.wfile.write(body.encode())
+
+          server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+          threading.Thread(target=server.serve_forever, daemon=True).start()
+          model = {'api': 'openai-completions', 'baseUrl': f'http://127.0.0.1:{server.server_port}/v1', 'apiKey': 'local-test-only', 'models': [{'id': 'brew-probe', 'name': 'Brew Probe', 'contextWindow': 128000, 'maxTokens': 4096, 'reasoning': False, 'input': ['text'], 'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0}}]}
+          (agent / 'models.json').write_text(json.dumps({'providers': {'brew-local': model}}))
+          env = dict(os.environ, PRIME_AGENT_CODING_AGENT_DIR=str(agent), DO_NOT_TRACK='1', UV_OFFLINE='1', PIP_NO_INDEX='1', PYTHONDONTWRITEBYTECODE='1')
+          if warmup:
+              env.pop('UV_OFFLINE', None)
+              env.pop('PIP_NO_INDEX', None)
+          else:
+              env['PATH'] = str(blocked) + os.pathsep + env['PATH']
+          env.pop('PRIME_AGENT_KERNEL_PYTHON', None)
+          result = subprocess.run([os.environ['TEST_AGENT_BINARY'], '--offline', '--mode', 'json', '--print', '--no-session', '--provider', 'brew-local', '--model', 'brew-probe', 'Run the local packaging probe.'], env=env, cwd=root, text=True, capture_output=True, timeout=120)
+          print(result.stderr)
+          print(result.stdout)
+          (root / 'agent-output.log').write_text(result.stderr + result.stdout)
+          (root / 'model-requests.json').write_text(json.dumps(requests, indent=2))
+          assert result.returncode == 0, result.returncode
+          assert len(requests) == 3, len(requests)
+          events = []
+          for line in result.stdout.splitlines():
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if isinstance(event, dict) and event.get('type') == 'tool_execution_end':
+                  events.append(event)
+          assert len(events) == 2, events
+          assert all(not event.get('isError', event.get('result', {}).get('isError', False)) for event in events), events
+          tools = [m for req in requests for m in req.get('messages', []) if m.get('role') == 'tool']
+          print('TOOL_RESULTS', json.dumps(tools))
+          assert any('FIRST_CELL_OK' in str(m) for m in tools)
+          assert any('PERSISTENCE_AND_ALL_SKILLS_OK 42' in str(m) for m in tools)
+          assert not any('ModuleNotFoundError' in str(m) or 'Traceback' in str(m) for m in tools)
+          assert not (root / 'kernel-venv').exists(), 'unexpected per-user bootstrap'
+          assert warmup or 'setting up python kernel' not in result.stderr
+          assert 'UV_MUST_NOT_RUN' not in result.stderr
+          assert not (root / 'uv-was-invoked').exists()
+          print('PASS: Windows released installer kernel; persistent cells and bundled/default imports; warmup=' + str(warmup))
+          print('PROBE_DIRECTORY', root)
+          server.shutdown()
+          '@ | Set-Content -Encoding utf8 runtime-smoke.py
+          $env:PRIME_SMOKE_WARMUP = '1'
+          & $python runtime-smoke.py 2>&1 | Tee-Object warmup.log
+          if ($LASTEXITCODE -ne 0) { throw 'normal session skill provisioning failed' }
+          $env:PRIME_SMOKE_WARMUP = '0'
+          $env:PI_OFFLINE = '1'
+          $env:HTTP_PROXY = 'http://127.0.0.1:9'
+          $env:HTTPS_PROXY = 'http://127.0.0.1:9'
+          $env:NO_PROXY = 'localhost,127.0.0.1'
+          & $python runtime-smoke.py 2>&1 | Tee-Object runtime.log
+          if ($LASTEXITCODE -ne 0) { throw 'persistent kernel smoke failed' }
+      - name: Save validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-0.10.0-runtime-evidence
+          path: |
+            ${{ runner.temp }}/prime-agent-0.10.0-smoke/*.log
+            ${{ runner.temp }}/prime-agent-0.10.0-smoke/*-probe/*.log
+            ${{ runner.temp }}/prime-agent-0.10.0-smoke/*-probe/model-requests.json
+          retention-days: 7
